@@ -1,20 +1,33 @@
 #!/bin/bash
 # alpkg - Aaron Linux Package Manager
 # Maintainer: endermanthecookie@gmail.com
-# Repository: https://packages-aaron-linux.vercel.app
 # Supports: .alp, .deb, .rpm, .pkg.tar.zst, APT repos, Pacman repos
+# Repositories: https://packages-aaron-linux.vercel.app
+
+VERSION="2.0"
 
 DB="/var/lib/alpkg"
 PKG_DIR="/var/packages"
 CACHE="/var/cache/alpkg"
 WORK_DIR="/tmp/alpkg-install"
 CONF="/etc/alpkg/alpkg.conf"
-REPO_INDEX="$CACHE/repo-index.json"
-
-REPO_URL="https://packages-aaron-linux.vercel.app"
+REPOS_FILE="/etc/alpkg/repos.conf"
+LOG="$DB/alpkg.log"
+YES=0
 
 if [ -f "$CONF" ]; then
     . "$CONF"
+fi
+
+REPOS=()
+if [ -f "$REPOS_FILE" ]; then
+    while IFS='|' read -r name url; do
+        [ -n "$name" ] && [ -n "$url" ] && REPOS+=("$name|$url")
+    done < "$REPOS_FILE"
+fi
+# Fallback to legacy REPO_URL
+if [ ${#REPOS[@]} -eq 0 ]; then
+    REPOS+=("main|${REPO_URL:-https://packages-aaron-linux.vercel.app}")
 fi
 
 BOOTSTRAP_MARKER="$DB/.bootstrapped"
@@ -179,13 +192,13 @@ bootstrap() {
 # ─── Help ─────────────────────────────────────────────────
 
 help() {
-    echo "alpkg - Aaron Linux Package Manager"
+    echo "alpkg v$VERSION - Aaron Linux Package Manager"
     echo "Maintainer: endermanthecookie@gmail.com"
     echo "Usage: alpkg <command> [options]"
     echo ""
     echo "Commands:"
     echo "  install <pkg>          Install package from any source"
-    echo "    --alpkg              Only search alpkg repository"
+    echo "    --alpkg              Only search alpkg repositories"
     echo "    --apt                Only search APT repositories"
     echo "    --pacman             Only search Pacman repositories"
     echo "  remove <name>          Remove package (requires root)"
@@ -193,16 +206,24 @@ help() {
     echo "    --name <query>       Filter by name (case insensitive)"
     echo "    --platform <src>     Filter: alpkg, apt, or pacman"
     echo "  search <query>         Search available packages"
+    echo "  download <pkg>         Download .alp package without installing"
+    echo "  verify <pkg>           Verify installed package files"
+    echo "  provides <file>        Find which package owns a file"
     echo "  bootstrap              Install/build missing backends (apt, pacman)"
     echo "  update                 Update package lists from all repos"
     echo "  info <pkg>             Show package info"
-    echo "  repo                   Show current repository URL"
-    echo "  repo set <url>         Set alpkg repository URL"
+    echo "  repo                   List configured repositories"
+    echo "  repo add <name> <url>  Add a repository"
+    echo "  repo remove <name>     Remove a repository"
+    echo "  repo set <url>         Set default repository URL (shortcut)"
     echo "  upgrade                Upgrade all installed alpkg packages"
     echo "  files <pkg>            List installed files for a package"
     echo "  autoremove             Remove orphaned packages (not in repo)"
     echo "  clean                  Clear package cache"
     echo "  convert <file>         Convert .deb/.rpm/.pkg.tar.zst to .alp"
+    echo ""
+    echo "Options:"
+    echo "  -y, --yes              Non-interactive mode (answer yes)"
     echo ""
     echo "Sources:"
     echo "  --alpkg  https://packages-aaron-linux.vercel.app (default)"
@@ -225,16 +246,30 @@ download() {
     else echo "Error: need curl or wget"; exit 1; fi
 }
 
+repo_index_path() {
+    local rname="$1"
+    echo "$CACHE/index-$rname.json"
+}
+
 fetch_index() {
-    mkdir -p "$CACHE"
-    echo "Fetching alpkg index from $REPO_URL..." >&2
-    if ! download "$REPO_URL/index.json" "$REPO_INDEX"; then
-        echo "Warning: failed to fetch alpkg index" >&2
-        return 1
-    fi
-    local count
-    count=$(grep -c '"name"' "$REPO_INDEX" 2>/dev/null || echo 0)
-    echo "OK ($count alpkg packages)" >&2
+    mkdir -p "$CACHE" 2>/dev/null
+    local total=0
+    for entry in "${REPOS[@]}"; do
+        local rname="${entry%%|*}"
+        local rurl="${entry#*|}"
+        local idx_path
+        idx_path=$(repo_index_path "$rname")
+        echo "Fetching alpkg index from $rname ($rurl)..." >&2
+        if download "$rurl/index.json" "$idx_path"; then
+            local count
+            count=$(grep -c '"name"' "$idx_path" 2>/dev/null || echo 0)
+            echo "  OK ($count packages)" >&2
+            total=$((total + count))
+        else
+            echo "  Warning: failed to fetch index from $rname" >&2
+        fi
+    done
+    echo "Total: $total packages across ${#REPOS[@]} repo(s)" >&2
 }
 
 # ─── .alp extraction / building ─────────────────────────────
@@ -247,11 +282,28 @@ extract_alp() {
 
 build_alp() {
     local name="$1" version="$2" desc="$3" data_dir="$4" out_file="$5"
+    local depends="$6"
     mkdir -p "$WORK_DIR/build"
     cd "$WORK_DIR/build" || exit 1
     tar -cJf data.tar.xz -C "$data_dir" .
+    local sha256=""
+    command -v sha256sum >/dev/null 2>&1 && sha256=$(sha256sum data.tar.xz | cut -d' ' -f1)
+    local deps_json="[]"
+    if [ -n "$depends" ]; then
+        deps_json="["
+        local first=1
+        IFS=',' read -ra DEP_ARR <<< "$depends"
+        for d in "${DEP_ARR[@]}"; do
+            d=$(echo "$d" | tr -d ' ')
+            [ -z "$d" ] && continue
+            [ "$first" -eq 0 ] && deps_json+=", "
+            deps_json+="\"$d\""
+            first=0
+        done
+        deps_json+="]"
+    fi
     cat > metadata.json << EOF
-{ "name": "$name", "version": "$version", "description": "$desc", "maintainer": "endermanthecookie@gmail.com" }
+{ "name": "$name", "version": "$version", "description": "$desc", "maintainer": "endermanthecookie@gmail.com", "depends": $deps_json, "sha256": "$sha256" }
 EOF
     cat > install.sh << 'INSTALL'
 #!/bin/bash
@@ -324,15 +376,67 @@ pkg_to_alp() {
 
 alpkg_fetch() {
     local pkg_name="$1"
-    local cached="$CACHE/$pkg_name.alp"
-    local url="$REPO_URL/packages/$pkg_name.alp"
-    echo "Trying alpkg repository..." >&2
-    if download "$url" "$cached" 2>/dev/null; then
-        echo "Found in alpkg repository!" >&2
-        echo "$cached"
-        return 0
-    fi
+    for entry in "${REPOS[@]}"; do
+        local rname="${entry%%|*}"
+        local rurl="${entry#*|}"
+        local cached="$CACHE/$rname-$pkg_name.alp"
+        echo "Trying $rname ($rurl)..." >&2
+        if download "$rurl/packages/$pkg_name.alp" "$cached" 2>/dev/null; then
+            echo "Found in $rname!" >&2
+            echo "$cached"
+            return 0
+        fi
+    done
     return 1
+}
+
+resolve_deps() {
+    local pkg_file="$1"
+    shift
+    local visited=("$@")
+    local name
+    name=$(basename "$pkg_file" .alp)
+
+    for v in "${visited[@]}"; do
+        [ "$v" = "$name" ] && echo "Error: circular dependency detected ($name)" >&2 && return 1
+    done
+    visited+=("$name")
+
+    local tmpd="$WORK_DIR/dep-check"
+    rm -rf "$tmpd"; mkdir -p "$tmpd"
+    (
+        cd "$tmpd" || exit 1
+        sed -n '/^---control---$/,/^---data---$/p' "$pkg_file" | grep -v "^---control---$" | grep -v "^---data---$" | base64 -d > control.tar.xz
+        tar -xJf control.tar.xz 2>/dev/null
+    )
+    local deps=""
+    if [ -f "$tmpd/metadata.json" ]; then
+        deps=$(python3 -c "
+import json
+d = json.load(open('$tmpd/metadata.json'))
+for dep in d.get('depends', []):
+    print(dep)
+" 2>/dev/null)
+    fi
+    rm -rf "$tmpd"
+
+    for dep in $deps; do
+        [ -z "$dep" ] && continue
+        if grep -qx "$dep" "$DB/db" 2>/dev/null; then
+            echo "Dependency $dep: already installed" >&2
+            continue
+        fi
+        echo "Dependency $dep: not installed, resolving..." >&2
+        local dep_file
+        dep_file=$(alpkg_fetch "$dep")
+        if [ -z "$dep_file" ]; then
+            echo "Error: dependency $dep not found in any repository" >&2
+            return 1
+        fi
+        resolve_deps "$dep_file" "${visited[@]}" || return 1
+        do_install "$dep_file"
+    done
+    return 0
 }
 
 apt_fetch() {
@@ -408,20 +512,26 @@ pacman_fetch() {
 
 list_alpkg() {
     local name_filter="$1"
-    [ ! -f "$REPO_INDEX" ] && fetch_index >/dev/null 2>&1
-    [ ! -f "$REPO_INDEX" ] && return
-
-    python3 -c "
-import json, sys
-with open('$REPO_INDEX') as f:
-    data = json.load(f)
-nf = '$name_filter'.lower()
-for p in data.get('packages', []):
-    pn = p.get('name', '').lower()
-    if nf and nf not in pn:
-        continue
-    print(f\"  {p.get('name')} v{p.get('version')} - {p.get('description')}\")
-" 2>/dev/null
+    for entry in "${REPOS[@]}"; do
+        local rname="${entry%%|*}"
+        local idx_path
+        idx_path=$(repo_index_path "$rname")
+        [ ! -f "$idx_path" ] && continue
+        local count
+        count=$(python3 -c "
+import json
+with open('$idx_path') as f:
+    d = json.load(f)
+pkgs = [p for p in d.get('packages',[]) if '$name_filter'.lower() in p.get('name','').lower()]
+for p in pkgs:
+    print(f\"  [{rname}] {p.get('name')} v{p.get('version')} - {p.get('description')}\")
+print(len(pkgs))
+" 2>/dev/null)
+        local pkg_count
+        pkg_count=$(echo "$count" | tail -1)
+        echo "$count" | head -n -1
+        [ "$pkg_count" = "0" ] && true
+    done
 }
 
 list_apt() {
@@ -459,14 +569,27 @@ list_pacman() {
 
 # ─── do_install ──────────────────────────────────────────────
 
+log_msg() {
+    local msg="$*"
+    mkdir -p "$DB"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $msg" >> "$LOG"
+}
+
 do_install() {
     local pkg_file="$1"
+    local skip_deps="$2"
     if [ "$EUID" -ne 0 ]; then
         echo "Error: installation requires root privileges"
         exit 1
     fi
     local name
     name=$(basename "$pkg_file" .alp)
+
+    if [ -z "$skip_deps" ]; then
+        echo "Resolving dependencies for $name..."
+        resolve_deps "$pkg_file" || { echo "Error: dependency resolution failed"; exit 1; }
+    fi
+
     echo "Installing $name..."
     rm -rf "$WORK_DIR/install"
     mkdir -p "$WORK_DIR/install"
@@ -480,6 +603,9 @@ d = json.load(open('metadata.json'))
 print(f\"Package: {d.get('name', '?')}\")
 print(f\"Version: {d.get('version', '?')}\")
 print(f\"Description: {d.get('description', '?')}\")
+deps = d.get('depends', [])
+if deps:
+    print(f'Depends: {\", \".join(deps)}')
 " 2>/dev/null || {
             echo "Package: $(grep -o '"name": *"[^"]*"' metadata.json | cut -d'"' -f4)"
             echo "Version: $(grep -o '"version": *"[^"]*"' metadata.json | cut -d'"' -f4)"
@@ -496,8 +622,11 @@ print(f\"Description: {d.get('description', '?')}\")
         tar -tJf data.tar.xz | sed 's/^/\//' > "$DB/manifests/$name.txt"
     fi
     mkdir -p "$DB"
-    echo "$name" >> "$DB/db"
+    if ! grep -qx "$name" "$DB/db" 2>/dev/null; then
+        echo "$name" >> "$DB/db"
+    fi
     echo "Installed: $name"
+    log_msg "install: $name v$pkg_version"
     rm -rf "$WORK_DIR/install"
 }
 
@@ -716,6 +845,86 @@ cmd_remove() {
     fi
     [ -f "$DB/db" ] && sed -i "/^$name$/d" "$DB/db" 2>/dev/null
     echo "Removed: $name"
+    log_msg "remove: $name"
+}
+
+cmd_download() {
+    local target="$1"
+    [ -z "$target" ] && { echo "Usage: alpkg download <pkg>"; exit 1; }
+    echo "Searching for $target..."
+    local pkg_file
+    pkg_file=$(alpkg_fetch "$target")
+    if [ -z "$pkg_file" ]; then
+        echo "Error: package '$target' not found in any repository"
+        exit 1
+    fi
+    local dest="./$target.alp"
+    cp "$pkg_file" "$dest"
+    echo "Downloaded: $dest"
+}
+
+cmd_verify() {
+    local name="$1"
+    [ -z "$name" ] && { echo "Usage: alpkg verify <pkg>"; exit 1; }
+    local manifest="$DB/manifests/$name.txt"
+    local ver_file="$DB/manifests/$name.version"
+    if [ ! -f "$manifest" ]; then
+        echo "Error: package '$name' is not installed via alpkg"
+        exit 1
+    fi
+    echo "Verifying $name..."
+    local errors=0
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        if [ -f "$file" ]; then
+            echo "  OK $file"
+        else
+            echo "  MISSING $file"
+            errors=$((errors + 1))
+        fi
+    done < "$manifest"
+    if [ -f "$ver_file" ]; then
+        echo "Version: $(cat "$ver_file")"
+    fi
+    if [ "$errors" -eq 0 ]; then
+        echo "Result: all files present"
+    else
+        echo "Result: $errors file(s) missing"
+        exit 1
+    fi
+}
+
+cmd_provides() {
+    local target="$1"
+    [ -z "$target" ] && { echo "Usage: alpkg provides <file>"; exit 1; }
+    target=$(echo "$target" | sed 's:^/*:/:')
+    echo "Searching for '$target'..."
+    local found=0
+    for mf in "$DB/manifests/"*.txt; do
+        [ -f "$mf" ] || continue
+        local pkg
+        pkg=$(basename "$mf" .txt)
+        if grep -Fx "$target" "$mf" >/dev/null 2>&1; then
+            echo "  $pkg: $target"
+            found=1
+        fi
+    done
+    if [ "$found" -eq 0 ]; then
+        # Try substring match
+        for mf in "$DB/manifests/"*.txt; do
+            [ -f "$mf" ] || continue
+            local pkg
+            pkg=$(basename "$mf" .txt)
+            if grep -q "$target" "$mf" 2>/dev/null; then
+                echo "  $pkg: $(grep "$target" "$mf" | head -3 | tr '\n' ' ')"
+                found=1
+            fi
+        done
+    fi
+    if [ "$found" -eq 0 ]; then
+        echo "No package owns '$target'"
+        exit 1
+    fi
 }
 
 cmd_files() {
@@ -730,6 +939,27 @@ cmd_files() {
     fi
 }
 
+find_latest_version() {
+    local pkg="$1"
+    for entry in "${REPOS[@]}"; do
+        local rname="${entry%%|*}"
+        local idx_path
+        idx_path=$(repo_index_path "$rname")
+        [ ! -f "$idx_path" ] && continue
+        local ver
+        ver=$(python3 -c "
+import json
+with open('$idx_path') as f:
+    data = json.load(f)
+for p in data.get('packages', []):
+    if p.get('name') == '$pkg':
+        print(p.get('version', ''))
+" 2>/dev/null)
+        [ -n "$ver" ] && echo "$ver" && return 0
+    done
+    return 1
+}
+
 cmd_upgrade() {
     if [ "$EUID" -ne 0 ]; then echo "Error: upgrade requires root privileges"; exit 1; fi
     if [ ! -f "$DB/db" ] || [ ! -s "$DB/db" ]; then
@@ -737,10 +967,6 @@ cmd_upgrade() {
         return
     fi
     fetch_index
-    if [ ! -f "$REPO_INDEX" ]; then
-        echo "Error: no index available"
-        exit 1
-    fi
     local upgraded=0
     while IFS= read -r pkg; do
         [ -z "$pkg" ] && continue
@@ -748,16 +974,9 @@ cmd_upgrade() {
         local ver_file="$DB/manifests/$pkg.version"
         [ -f "$ver_file" ] && installed_version=$(cat "$ver_file")
         local latest_version
-        latest_version=$(python3 -c "
-import json
-with open('$REPO_INDEX') as f:
-    data = json.load(f)
-for p in data.get('packages', []):
-    if p.get('name') == '$pkg':
-        print(p.get('version', ''))
-" 2>/dev/null)
+        latest_version=$(find_latest_version "$pkg")
         if [ -z "$latest_version" ]; then
-            echo "$pkg: not found in repository, skipping"
+            echo "$pkg: not found in any repository, skipping"
             continue
         fi
         if [ "$latest_version" != "$installed_version" ]; then
@@ -774,6 +993,7 @@ for p in data.get('packages', []):
     done < "$DB/db"
     echo ""
     echo "Upgrade complete: $upgraded package(s) upgraded"
+    log_msg "upgrade: $upgraded package(s) upgraded"
 }
 
 cmd_clean() {
@@ -790,6 +1010,28 @@ cmd_clean() {
     echo "Cleaned: $size freed"
 }
 
+is_in_any_repo() {
+    local pkg="$1"
+    for entry in "${REPOS[@]}"; do
+        local rname="${entry%%|*}"
+        local idx_path
+        idx_path=$(repo_index_path "$rname")
+        [ ! -f "$idx_path" ] && continue
+        local found
+        found=$(python3 -c "
+import json
+with open('$idx_path') as f:
+    data = json.load(f)
+for p in data.get('packages', []):
+    if p.get('name') == '$pkg':
+        print('yes')
+        break
+" 2>/dev/null)
+        [ "$found" = "yes" ] && echo "yes" && return 0
+    done
+    return 1
+}
+
 cmd_autoremove() {
     if [ "$EUID" -ne 0 ]; then echo "Error: autoremove requires root privileges"; exit 1; fi
     if [ ! -f "$DB/db" ] || [ ! -s "$DB/db" ]; then
@@ -797,37 +1039,26 @@ cmd_autoremove() {
         return
     fi
     fetch_index 2>/dev/null
-    if [ ! -f "$REPO_INDEX" ]; then
-        echo "Error: no index available"
-        exit 1
-    fi
     local orphans=()
     while IFS= read -r pkg; do
         [ -z "$pkg" ] && continue
-        local found
-        found=$(python3 -c "
-import json
-with open('$REPO_INDEX') as f:
-    data = json.load(f)
-for p in data.get('packages', []):
-    if p.get('name') == '$pkg':
-        print('yes')
-        break
-" 2>/dev/null)
-        if [ "$found" != "yes" ]; then
-            orphans+=("$pkg")
-        fi
+        local found; found=$(is_in_any_repo "$pkg")
+        [ "$found" != "yes" ] && orphans+=("$pkg")
     done < "$DB/db"
     if [ ${#orphans[@]} -eq 0 ]; then
         echo "No orphaned packages found."
         return
     fi
-    echo "Orphaned packages (not in alpkg repository):"
+    echo "Orphaned packages (not in any repository):"
     for pkg in "${orphans[@]}"; do
         echo "  - $pkg"
     done
     echo ""
-    read -r -p "Remove these packages? [y/N]: " confirm
+    if [ "$YES" -eq 0 ]; then
+        read -r -p "Remove these packages? [y/N]: " confirm
+    else
+        confirm="y"
+    fi
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         for pkg in "${orphans[@]}"; do
             cmd_remove "$pkg"
@@ -843,26 +1074,38 @@ cmd_info() {
         tar -xJf control.tar.xz 2>/dev/null
         [ -f metadata.json ] && cat metadata.json
         rm -rf /tmp/alpkg-info
-    elif [ -f "$REPO_INDEX" ]; then
-        python3 -c "
+        return
+    fi
+    for entry in "${REPOS[@]}"; do
+        local rname="${entry%%|*}"
+        local idx_path
+        idx_path=$(repo_index_path "$rname")
+        [ ! -f "$idx_path" ] && continue
+        local found
+        found=$(python3 -c "
 import json, sys
-with open('$REPO_INDEX') as f:
+with open('$idx_path') as f:
     data = json.load(f)
 for p in data.get('packages', []):
     if p.get('name') == '$target':
         print(json.dumps(p, indent=2))
         sys.exit(0)
-print('Package not found')
-" 2>/dev/null
-    else
-        echo "Error: no index cached. Run 'alpkg update' first"; exit 1
-    fi
+" 2>/dev/null)
+        if [ -n "$found" ]; then
+            echo "[$rname]"
+            echo "$found"
+            return
+        fi
+    done
+    echo "Package '$target' not found in any repository."
+    echo "Run 'alpkg update' first if indexes are empty."
+    exit 1
 }
 
 cmd_search() {
     local query="$1"
 
-    echo "=== alpkg ($REPO_URL) ==="
+    echo "=== alpkg repositories ==="
     list_alpkg "$query"
     echo ""
 
@@ -890,33 +1133,86 @@ cmd_update() {
 }
 
 cmd_repo() {
-    local action="$2"
-    if [ "$action" = "set" ]; then
-        local new_url="$3"
-        [ -z "$new_url" ] && { echo "Usage: sudo alpkg repo set <url>"; exit 1; }
-        mkdir -p "$(dirname "$CONF")"
-        cat > "$CONF" << EOF
-# alpkg configuration
-# Maintainer: endermanthecookie@gmail.com
-# Repository: https://packages-aaron-linux.vercel.app
-# To change source: sudo alpkg repo set <url>
-REPO_URL="$new_url"
-EOF
-        echo "Repository set to: $new_url"
-    else
-        echo "Current alpkg repository: $REPO_URL"
-        echo "Config file: $CONF"
-        echo ""
-        echo "To change: sudo alpkg repo set <url>"
-        echo "Default:   https://packages-aaron-linux.vercel.app"
-        command -v apt-cache >/dev/null 2>&1 && echo "APT:     available"
-        command -v pacman >/dev/null 2>&1 && echo "Pacman:  available"
-    fi
+    local sub="$1"
+    mkdir -p "$(dirname "$REPOS_FILE")" 2>/dev/null
+    case "$sub" in
+        add)
+            local rname="$2" rurl="$3"
+            [ -z "$rname" ] || [ -z "$rurl" ] && { echo "Usage: alpkg repo add <name> <url>"; exit 1; }
+            if grep -q "^$rname|" "$REPOS_FILE" 2>/dev/null; then
+                echo "Repository '$rname' already exists. Use 'repo remove $rname' first."
+                exit 1
+            fi
+            echo "$rname|$rurl" >> "$REPOS_FILE"
+            echo "Added repository: $rname -> $rurl"
+            ;;
+        remove)
+            local rname="$2"
+            [ -z "$rname" ] && { echo "Usage: alpkg repo remove <name>"; exit 1; }
+            if [ ! -f "$REPOS_FILE" ]; then
+                echo "Error: no repositories configured"
+                exit 1
+            fi
+            if grep -q "^$rname|" "$REPOS_FILE"; then
+                grep -v "^$rname|" "$REPOS_FILE" > "${REPOS_FILE}.tmp" && mv "${REPOS_FILE}.tmp" "$REPOS_FILE"
+                echo "Removed repository: $rname"
+                # Clean up cached index
+                rm -f "$CACHE/index-$rname.json"
+            else
+                echo "Error: repository '$rname' not found"
+                exit 1
+            fi
+            ;;
+        set)
+            local new_url="$2"
+            [ -z "$new_url" ] && { echo "Usage: alpkg repo set <url>"; exit 1; }
+            if grep -q "^main|" "$REPOS_FILE" 2>/dev/null; then
+                grep -v "^main|" "$REPOS_FILE" > "${REPOS_FILE}.tmp" && mv "${REPOS_FILE}.tmp" "$REPOS_FILE"
+            fi
+            echo "main|$new_url" >> "$REPOS_FILE"
+            echo "Default repository set to: $new_url"
+            ;;
+        *)
+            if [ ! -f "$REPOS_FILE" ]; then
+                echo "No repositories configured."
+                echo "Default: https://packages-aaron-linux.vercel.app"
+            else
+                echo "Configured repositories:"
+                echo ""
+                while IFS='|' read -r name url; do
+                    local idx="$CACHE/index-$name.json"
+                    local count="?"
+                    [ -f "$idx" ] && count=$(grep -c '"name"' "$idx" 2>/dev/null || echo "?")
+                    echo "  $name"
+                    echo "    URL:   $url"
+                    echo "    Cache: $count packages"
+                    echo ""
+                done < "$REPOS_FILE"
+            fi
+            echo "Commands:"
+            echo "  alpkg repo add <name> <url>     Add a repository"
+            echo "  alpkg repo remove <name>        Remove a repository"
+            echo "  alpkg repo set <url>            Set default (main) repository"
+            command -v apt-cache >/dev/null 2>&1 && echo ""
+            command -v apt-cache >/dev/null 2>&1 && echo "APT:     available"
+            command -v pacman >/dev/null 2>&1 && echo "Pacman:  available"
+            ;;
+    esac
 }
 
 if [ $# -lt 1 ]; then help; exit 1; fi
 
-mkdir -p "$DB" "$PKG_DIR" "$CACHE"
+# Parse global flags
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes) YES=1 ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+set -- "${ARGS[@]}"
+
+mkdir -p "$DB" "$PKG_DIR" "$CACHE" 2>/dev/null
 
 if [ ! -f "$BOOTSTRAP_MARKER" ] && [ "$1" != "bootstrap" ]; then
     echo "alpkg: first run detected. Running bootstrap..."
@@ -929,6 +1225,9 @@ case "$1" in
     install) shift; cmd_install "$@" ;;
     remove) shift; cmd_remove "$@" ;;
     list) shift; cmd_list "$@" ;;
+    download) cmd_download "$2" ;;
+    verify) cmd_verify "$2" ;;
+    provides) cmd_provides "$2" ;;
     files) cmd_files "$2" ;;
     upgrade) cmd_upgrade ;;
     autoremove) cmd_autoremove ;;
@@ -936,7 +1235,7 @@ case "$1" in
     info) cmd_info "$2" ;;
     search) cmd_search "$2" ;;
     update) cmd_update ;;
-    repo) cmd_repo "$@" ;;
+    repo) shift; cmd_repo "$@" ;;
     convert) cmd_convert "$2" ;;
     *) help ;;
 esac
